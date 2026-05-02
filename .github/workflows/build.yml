@@ -62,7 +62,7 @@ jobs:
     name: Upload to R2
     needs:
       - build-firmware
-    uses: esphome/workflows/.github/workflows/upload-to-r2.yml@2025.10.0
+    uses: esphome/workflows/.github/workflows/upload-to-r2.yml@2026.4.1
     with:
       directory: ${{ github.event.repository.name }}
     secrets: inherit
