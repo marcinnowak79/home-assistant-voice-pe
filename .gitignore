@@ -78,6 +78,7 @@ cov.xml
 # Environments
 .env
 .venv
+esphome_venv/
 env/
 venv/
 ENV/
@@ -102,6 +103,7 @@ CMakeLists.txt
 .idea/dictionaries
 
 # Sensitive or high-churn files:
+secrets.yaml
 .idea/**/dataSources/
 .idea/**/dataSources.ids
 .idea/**/dataSources.xml
