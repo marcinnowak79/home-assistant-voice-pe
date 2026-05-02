@@ -151,6 +151,11 @@ globals:
     type: int
     restore_value: no
     initial_value: ${voice_assist_not_ready_phase_id}
+  # Tracks the custom Gemini session so we can restart wake-word detection after it ends.
+  - id: gemini_proxy_was_running
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   # Global variable tracking if the dial was recently touched.
   - id: dial_touched
     type: bool
@@ -1744,6 +1749,8 @@ micro_wake_word:
             - switch.is_off: master_mute_switch
             - lambda: return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};
         then:
+          # The custom Gemini stream owns the microphone until the session ends.
+          - micro_wake_word.stop:
           # Immediate active-color feedback while the wake sound plays.
           - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
           - script.execute: control_leds
@@ -1803,6 +1810,7 @@ interval:
   - interval: 100ms
     then:
       - lambda: |-
+          bool gemini_running = id(gemini_proxy_client).is_running();
           int phase = id(gemini_proxy_client).consume_pending_phase();
           if (phase >= 0) {
             id(voice_assistant_phase) = phase;
@@ -1820,6 +1828,10 @@ interval:
           } else {
             stuck_count = 0;
           }
+          if (id(gemini_proxy_was_running) && !gemini_running) {
+            id(mww).start();
+          }
+          id(gemini_proxy_was_running) = gemini_running;
 
 voice_assistant:
   id: va
