@@ -17,6 +17,7 @@ CONF_MICROPHONE = "microphone"
 CONF_SPEAKER = "speaker"
 CONF_MEDIA_PLAYER = "media_player"
 CONF_PROXY_URL = "proxy_url"
+CONF_DEBUG_LOGGING = "debug_logging"
 
 gemini_proxy_ns = cg.esphome_ns.namespace("gemini_proxy")
 GeminiProxy = gemini_proxy_ns.class_("GeminiProxy", cg.Component)
@@ -31,6 +32,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Required(CONF_MEDIA_PLAYER): cv.use_id(media_player.MediaPlayer),
         cv.Required(CONF_PROXY_URL): cv.string,
+        cv.Optional(CONF_DEBUG_LOGGING, default=False): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -63,5 +65,6 @@ async def to_code(config):
     cg.add(var.set_media_player(mp))
 
     cg.add(var.set_proxy_url(config[CONF_PROXY_URL]))
+    cg.add(var.set_debug_logging(config[CONF_DEBUG_LOGGING]))
 
     # esp_websocket_client is included in ESP-IDF SDK — no extra library needed

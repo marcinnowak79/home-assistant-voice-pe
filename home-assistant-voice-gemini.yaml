@@ -16,6 +16,10 @@ substitutions:
   voice_assist_error_phase_id: '11'
   # Change this to true in case you ahve a hidden SSID at home.
   hidden_ssid: "false"
+  # Set to true when diagnosing Gemini proxy / LED / media-player state flow.
+  gemini_debug_logging: "false"
+  # Set to DEBUG together with gemini_debug_logging for full ESPHome diagnostics.
+  log_level: "INFO"
   # Substitutions for audio files
   jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac
   jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
@@ -103,7 +107,7 @@ network:
   enable_ipv6: true
 
 logger:
-  level: DEBUG
+  level: ${log_level}
   logs:
     sensor: WARN  # avoids logging debug sensor updates
 
@@ -1667,6 +1671,14 @@ media_player:
           decibel_reduction: 20
           duration: 0.0s
     on_state:
+      - lambda: |-
+          if (${gemini_debug_logging}) {
+            ESP_LOGW("gemini_proxy_yaml",
+                     "[diag] media_on_state phase=%d gemini_running=%d announcing=%d media_state=%d",
+                     id(voice_assistant_phase), id(gemini_proxy_client).is_running(),
+                     id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING,
+                     static_cast<int>(id(external_media_player).state));
+          }
       - if:
           condition:
             and:
@@ -1679,7 +1691,15 @@ media_player:
                 id: media_mixing_input
                 decibel_reduction: 0
                 duration: 1.0s
-            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            - lambda: |-
+                if (${gemini_debug_logging}) {
+                  ESP_LOGW("gemini_proxy_yaml",
+                           "[diag] media_on_state_idle_reset phase=%d gemini_running=%d announcing=%d media_state=%d",
+                           id(voice_assistant_phase), id(gemini_proxy_client).is_running(),
+                           id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING,
+                           static_cast<int>(id(external_media_player).state));
+                }
+                id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - script.execute: control_leds
 
 voice_kit:
@@ -1743,6 +1763,14 @@ micro_wake_word:
       internal: true
   vad:
   on_wake_word_detected:
+    - lambda: |-
+        if (${gemini_debug_logging}) {
+          ESP_LOGW("gemini_proxy_yaml",
+                   "[diag] wake_detected phase=%d gemini_running=%d media_announcing=%d media_state=%d",
+                   id(voice_assistant_phase), id(gemini_proxy_client).is_running(),
+                   id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING,
+                   static_cast<int>(id(external_media_player).state));
+        }
     - if:
         condition:
           and:
@@ -1751,9 +1779,21 @@ micro_wake_word:
         then:
           # The custom Gemini stream owns the microphone until the session ends.
           - micro_wake_word.stop:
+          - delay: 100ms
           # Immediate active-color feedback while the wake sound plays.
-          - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+          - lambda: |-
+              id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+              if (${gemini_debug_logging}) {
+                ESP_LOGW("gemini_proxy_yaml", "[diag] wake_accepted phase=%d", id(voice_assistant_phase));
+              }
           - script.execute: control_leds
+          - gemini_proxy.start:
+          - lambda: |-
+              if (${gemini_debug_logging}) {
+                ESP_LOGW("gemini_proxy_yaml",
+                         "[diag] gemini_proxy_start_returned phase=%d gemini_running=%d",
+                         id(voice_assistant_phase), id(gemini_proxy_client).is_running());
+              }
           - if:
               condition:
                 switch.is_on: wake_sound
@@ -1763,7 +1803,6 @@ micro_wake_word:
                     priority: true
                     sound_file: "wake_word_triggered_sound"
                 - delay: 300ms
-          - gemini_proxy.start:
 
 select:
   - platform: template
@@ -1802,6 +1841,7 @@ gemini_proxy:
   microphone: i2s_mics
   media_player: external_media_player
   proxy_url: !secret gemini_proxy_url
+  debug_logging: ${gemini_debug_logging}
 
   # LED color changes handled by YAML callbacks only
 
@@ -1813,14 +1853,24 @@ interval:
           bool gemini_running = id(gemini_proxy_client).is_running();
           int phase = id(gemini_proxy_client).consume_pending_phase();
           if (phase >= 0) {
+            if (${gemini_debug_logging}) {
+              ESP_LOGW("gemini_proxy_yaml",
+                       "[diag] phase_update old=%d new=%d gemini_running=%d media_announcing=%d media_state=%d",
+                       id(voice_assistant_phase), phase, gemini_running,
+                       id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING,
+                       static_cast<int>(id(external_media_player).state));
+            }
             id(voice_assistant_phase) = phase;
             id(control_leds).execute();
           }
           // Safety: reset stuck LEDs if session ended but phase still active
           static int stuck_count = 0;
           int p = id(voice_assistant_phase);
-          if ((p == 3 || p == 5) && !id(gemini_proxy_client).is_running()) {
+          if ((p == 3 || p == 4 || p == 5) && !id(gemini_proxy_client).is_running()) {
             if (++stuck_count > 50) {  // 5 seconds
+              if (${gemini_debug_logging}) {
+                ESP_LOGW("gemini_proxy_yaml", "[diag] stuck active phase reset phase=%d running=%d", p, gemini_running);
+              }
               id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
               id(control_leds).execute();
               stuck_count = 0;
@@ -1829,6 +1879,9 @@ interval:
             stuck_count = 0;
           }
           if (id(gemini_proxy_was_running) && !gemini_running) {
+            if (${gemini_debug_logging}) {
+              ESP_LOGW("gemini_proxy_yaml", "[diag] gemini_proxy stopped; restarting wake word phase=%d", id(voice_assistant_phase));
+            }
             id(mww).start();
           }
           id(gemini_proxy_was_running) = gemini_running;

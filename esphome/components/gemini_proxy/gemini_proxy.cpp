@@ -1,6 +1,9 @@
 #include "gemini_proxy.h"
 #include "esphome/core/log.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -11,8 +14,42 @@ namespace gemini_proxy {
 static const char *TAG = "gemini_proxy";
 static std::atomic<int> g_set_phase{-1};  // -1 = no change, >=0 = set voice_assistant_phase
 
+const char *GeminiProxy::state_name_(SessionState state) {
+  switch (state) {
+    case SessionState::IDLE:
+      return "IDLE";
+    case SessionState::CONNECTING:
+      return "CONNECTING";
+    case SessionState::STREAMING_MIC:
+      return "STREAMING_MIC";
+    case SessionState::WAITING_RESPONSE:
+      return "WAITING_RESPONSE";
+    case SessionState::RESPONDING:
+      return "RESPONDING";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void GeminiProxy::log_state_(const char *event, const char *reason) {
+  if (!this->debug_logging_)
+    return;
+  uint32_t now = millis();
+  SessionState state = this->session_state_.load();
+  uint32_t stream_ms = this->streaming_started_ms_ == 0 ? 0 : now - this->streaming_started_ms_;
+  uint32_t wait_ms = this->waiting_response_started_ms_ == 0 ? 0 : now - this->waiting_response_started_ms_;
+  uint32_t response_ms = this->response_started_ms_ == 0 ? 0 : now - this->response_started_ms_;
+  ESP_LOGW(TAG,
+           "[diag] event=%s reason=%s sid=%u state=%s ws=%d mic=%d stream_ms=%u wait_ms=%u response_ms=%u "
+           "chunks=%u bytes=%u failures=%u play_audio=%d",
+           event, reason, this->session_id_, state_name_(state), this->ws_connected_.load(),
+           this->mic_ != nullptr && this->mic_->is_running(), stream_ms, wait_ms, response_ms,
+           this->audio_chunks_sent_.load(), this->audio_bytes_sent_.load(),
+           this->audio_send_failures_.load(), this->play_audio_.load());
+}
+
 void GeminiProxy::setup() {
-  ESP_LOGW(TAG, "Setup, url: %s", this->proxy_url_.c_str());
+  ESP_LOGCONFIG(TAG, "Gemini proxy URL: %s", this->proxy_url_.c_str());
 
   // 64KB after mono16 conversion is ~2 seconds of audio at 16kHz.
   this->ring_buffer_ = RingBuffer::create(65536);
@@ -43,106 +80,167 @@ void GeminiProxy::setup() {
 }
 
 void GeminiProxy::loop() {
+  if (this->stop_mic_requested_.exchange(false)) {
+    if (this->mic_ != nullptr && this->mic_->is_running()) {
+      this->mic_->stop();
+      if (this->debug_logging_)
+        ESP_LOGW(TAG, "[diag] mic_stop_called sid=%u", this->session_id_);
+    } else {
+      if (this->debug_logging_)
+        ESP_LOGW(TAG, "[diag] mic_stop_skipped sid=%u mic_present=%d mic_running=%d", this->session_id_,
+                 this->mic_ != nullptr, this->mic_ != nullptr && this->mic_->is_running());
+    }
+  }
+
   if (this->disconnect_requested_.exchange(false)) {
-    this->disconnect_();
+    this->log_state_("loop_disconnect_requested", "async_request");
+    this->disconnect_("loop_disconnect_requested");
   }
 
   // If WS dropped while session active, reset state (safe — runs on main thread)
   SessionState state = this->session_state_.load();
+  uint32_t now = millis();
+  if (state != this->last_logged_state_) {
+    this->last_logged_state_ = state;
+    this->log_state_("loop_state_transition", "state_changed");
+  }
+  if (this->debug_logging_ && state != SessionState::IDLE && now - this->last_active_diag_ms_ > 1000) {
+    this->last_active_diag_ms_ = now;
+    int media_state = this->media_player_ == nullptr ? -1 : static_cast<int>(this->media_player_->state);
+    bool announcing = this->media_player_ != nullptr &&
+                      this->media_player_->state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING;
+    ESP_LOGW(TAG,
+             "[diag] active_heartbeat sid=%u state=%s ws=%d mic=%d media_state=%d announcing=%d "
+             "ring_available=%u dropped=%u play_audio=%d",
+             this->session_id_, state_name_(state), this->ws_connected_.load(),
+             this->mic_ != nullptr && this->mic_->is_running(), media_state, announcing,
+             this->ring_buffer_ ? static_cast<unsigned>(this->ring_buffer_->available()) : 0,
+             static_cast<unsigned>(this->dropped_audio_bytes_.load()), this->play_audio_.load());
+  }
   if (state == SessionState::CONNECTING && millis() - this->connect_started_ms_ > 5000) {
     ESP_LOGE(TAG, "WS connect timed out");
-    this->reset_session_(false);
+    this->log_state_("connect_timeout", "connect_5s");
+    this->reset_session_(false, "connect_timeout");
     this->disconnect_requested_.store(true);
     g_set_phase.store(1);
     state = SessionState::IDLE;
   }
 
   if (state != SessionState::IDLE && state != SessionState::CONNECTING && !this->ws_connected_.load()) {
-    ESP_LOGW(TAG, "WS lost during session, resetting");
-    this->reset_session_(false);
+    this->log_state_("ws_lost_during_session", "ws_connected_false");
+    this->reset_session_(false, "ws_lost_during_session");
     g_set_phase.store(1);  // idle
     state = SessionState::IDLE;
   }
 
   if (this->start_mic_requested_.exchange(false)) {
+    this->log_state_("start_mic_requested", "loop");
     if (this->mic_ != nullptr && !this->mic_->is_running()) {
       this->mic_->start();
+      if (this->debug_logging_)
+        ESP_LOGW(TAG, "[diag] mic_start_called sid=%u", this->session_id_);
+    } else {
+      if (this->debug_logging_)
+        ESP_LOGW(TAG, "[diag] mic_start_skipped sid=%u mic_present=%d mic_running=%d", this->session_id_,
+                 this->mic_ != nullptr, this->mic_ != nullptr && this->mic_->is_running());
     }
     if (this->ring_buffer_) {
       this->ring_buffer_->reset();
     }
     this->dropped_audio_bytes_.store(0);
+    this->audio_chunks_sent_.store(0);
+    this->audio_bytes_sent_.store(0);
+    this->audio_send_failures_.store(0);
+    this->streaming_started_ms_ = millis();
+    this->waiting_response_started_ms_ = 0;
+    this->response_started_ms_ = 0;
     this->session_state_.store(SessionState::STREAMING_MIC);
+    this->start_audio_tx_task_();
     g_set_phase.store(3);  // listening phase — green spin
-    ESP_LOGW(TAG, ">>> ACTIVE ws=%d", this->ws_connected_.load());
+    this->log_state_("active_streaming", "ws_connected");
   }
 
-  // Send buffered mic data to proxy
-  if (this->session_state_.load() == SessionState::STREAMING_MIC && this->ws_connected_.load() && this->ring_buffer_) {
-    size_t available = this->ring_buffer_->available();
-    if (available > 0) {
-      size_t to_read = std::min(available, (size_t) 4096);
-      uint8_t buf[4096];
-      size_t read = this->ring_buffer_->read((void *) buf, to_read, 0);
-      if (read > 0) {
-        this->send_binary_(MSG_AUDIO_IN, buf, read);
-      }
-    }
+  if (this->session_state_.load() == SessionState::WAITING_RESPONSE &&
+      millis() - this->waiting_response_started_ms_ > 20000) {
+    this->log_state_("response_wait_timeout", "wait_20s");
+    this->reset_session_(false, "response_wait_timeout");
+    this->disconnect_requested_.store(true);
+    g_set_phase.store(1);
+  }
 
-    size_t dropped = this->dropped_audio_bytes_.exchange(0);
-    if (dropped > 0) {
-      ESP_LOGW(TAG, "Dropped %u bytes of microphone audio", static_cast<unsigned>(dropped));
-    }
+  size_t dropped = this->dropped_audio_bytes_.exchange(0);
+  if (dropped > 0) {
+    ESP_LOGW(TAG, "Dropped %u bytes of microphone audio", static_cast<unsigned>(dropped));
   }
 
   // Play audio URL via media_player (triggered from WS thread, executed here on main thread)
   if (this->play_audio_.exchange(false) && this->media_player_ != nullptr) {
     std::string audio_url = this->take_audio_url_();
-    ESP_LOGW(TAG, "Playing: %s", audio_url.c_str());
+    if (this->debug_logging_)
+      ESP_LOGW(TAG, "[diag] media_play_begin sid=%u url=%s media_state=%d announcing=%d",
+               this->session_id_, audio_url.c_str(), static_cast<int>(this->media_player_->state),
+               this->media_player_->state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING);
     this->media_player_->make_call()
         .set_media_url(audio_url)
         .set_announcement(true)
         .perform();
+    if (this->debug_logging_)
+      ESP_LOGW(TAG, "[diag] media_play_perform_done sid=%u media_state=%d announcing=%d",
+               this->session_id_, static_cast<int>(this->media_player_->state),
+               this->media_player_->state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING);
+  } else if (this->play_audio_.load() && this->media_player_ == nullptr) {
+    if (this->debug_logging_)
+      ESP_LOGW(TAG, "[diag] media_play_pending_without_media_player sid=%u", this->session_id_);
   }
 }
 
 void GeminiProxy::start() {
   SessionState expected = SessionState::IDLE;
   if (!this->session_state_.compare_exchange_strong(expected, SessionState::CONNECTING)) {
-    ESP_LOGW(TAG, "Already active, ignoring start (state=%u)", static_cast<unsigned>(expected));
+    ESP_LOGW(TAG, "Already active, ignoring start (state=%s)", state_name_(expected));
+    this->log_state_("start_ignored", "not_idle");
     return;
   }
 
-  ESP_LOGW(TAG, ">>> START");
+  this->session_id_++;
   this->connect_started_ms_ = millis();
+  this->streaming_started_ms_ = 0;
+  this->waiting_response_started_ms_ = 0;
+  this->response_started_ms_ = 0;
   this->play_audio_.store(false);
+  this->stop_mic_requested_.store(false);
+  this->last_active_diag_ms_ = 0;
+  this->last_logged_state_ = SessionState::CONNECTING;
   if (this->ring_buffer_) {
     this->ring_buffer_->reset();
   }
+  this->log_state_("start", "wake_word");
   this->connect_();
 }
 
 void GeminiProxy::stop() {
-  ESP_LOGI(TAG, "Stopping");
+  this->log_state_("stop_called", "yaml_or_action");
   if (this->ws_connected_.load()) {
     this->send_binary_(MSG_AUDIO_END, nullptr, 0);
   }
-  this->reset_session_(false);
+  this->reset_session_(false, "stop_called");
   this->disconnect_requested_.store(true);
   g_set_phase.store(1);
 }
 
 void GeminiProxy::connect_() {
-  this->disconnect_();
+  this->disconnect_("connect_replaces_existing");
 
   esp_websocket_client_config_t config = {};
   config.uri = this->proxy_url_.c_str();
   config.buffer_size = 4096;
   config.task_stack = 8192;
+  config.disable_auto_reconnect = true;
 
   this->ws_ = esp_websocket_client_init(&config);
   if (this->ws_ == nullptr) {
     ESP_LOGE(TAG, "WS init failed");
+    this->log_state_("ws_init_failed", "init_null");
     return;
   }
 
@@ -151,21 +249,30 @@ void GeminiProxy::connect_() {
   esp_err_t err = esp_websocket_client_start(this->ws_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "WS start failed: %s", esp_err_to_name(err));
-    this->reset_session_(true);
+    this->reset_session_(true, "ws_start_failed");
     g_set_phase.store(1);
+  } else {
+    this->log_state_("ws_start_requested", "connect");
   }
 }
 
-void GeminiProxy::disconnect_() {
+void GeminiProxy::disconnect_(const char *reason) {
+  this->log_state_("disconnect_begin", reason);
+  this->stop_audio_tx_task_(reason);
   if (this->ws_ != nullptr) {
+    if (this->debug_logging_)
+      ESP_LOGW(TAG, "[diag] websocket_stop_destroy sid=%u reason=%s", this->session_id_, reason);
+    std::lock_guard<std::mutex> lock(this->ws_mutex_);
     esp_websocket_client_stop(this->ws_);
     esp_websocket_client_destroy(this->ws_);
     this->ws_ = nullptr;
   }
   this->ws_connected_.store(false);
+  this->log_state_("disconnect_end", reason);
 }
 
 void GeminiProxy::send_binary_(uint8_t type, const uint8_t *data, size_t len) {
+  std::lock_guard<std::mutex> lock(this->ws_mutex_);
   if (!this->ws_connected_.load() || this->ws_ == nullptr)
     return;
 
@@ -175,25 +282,38 @@ void GeminiProxy::send_binary_(uint8_t type, const uint8_t *data, size_t len) {
     memcpy(&frame[1], data, len);
   }
 
+  // Audio is sent from a dedicated task, so a longer timeout no longer blocks
+  // ESPHome's main loop. Short timeouts make esp_websocket_client treat normal
+  // backpressure as a fatal transport error.
+  TickType_t timeout = pdMS_TO_TICKS(1000);
   esp_err_t err = esp_websocket_client_send_bin(this->ws_,
                                                 (const char *) frame.data(),
                                                 frame.size(),
-                                                pdMS_TO_TICKS(50));
+                                                timeout);
   if (err < 0) {
-    ESP_LOGW(TAG, "WS send failed: %d", err);
+    this->audio_send_failures_.fetch_add(1);
+    ESP_LOGW(TAG, "WS send failed: %d type=%u len=%u sid=%u state=%s", err, type,
+             static_cast<unsigned>(len), this->session_id_, state_name_(this->session_state_.load()));
+  } else if (type == MSG_AUDIO_IN) {
+    this->audio_chunks_sent_.fetch_add(1);
+    this->audio_bytes_sent_.fetch_add(len);
   }
 }
 
-void GeminiProxy::reset_session_(bool close_socket) {
+void GeminiProxy::reset_session_(bool close_socket, const char *reason) {
+  this->log_state_("reset_session_begin", reason);
   this->session_state_.store(SessionState::IDLE);
   this->start_mic_requested_.store(false);
+  this->stop_mic_requested_.store(true);
+  this->stop_audio_tx_task_(reason);
   this->play_audio_.store(false);
   if (this->ring_buffer_) {
     this->ring_buffer_->reset();
   }
   if (close_socket) {
-    this->disconnect_();
+    this->disconnect_(reason);
   }
+  this->log_state_("reset_session_end", reason);
 }
 
 std::string GeminiProxy::build_default_audio_url_() const {
@@ -221,6 +341,86 @@ std::string GeminiProxy::take_audio_url_() {
   return this->audio_url_;
 }
 
+void GeminiProxy::start_audio_tx_task_() {
+  if (this->audio_tx_running_.exchange(true)) {
+    if (this->debug_logging_)
+      ESP_LOGW(TAG, "[diag] audio_tx_already_running sid=%u", this->session_id_);
+    return;
+  }
+  this->audio_tx_stop_requested_.store(false);
+  BaseType_t ok = xTaskCreatePinnedToCore(audio_tx_task_, "gemini_audio_tx", 8192, this, 5, nullptr, 1);
+  if (ok != pdPASS) {
+    this->audio_tx_running_.store(false);
+    this->audio_tx_stop_requested_.store(false);
+    ESP_LOGE(TAG, "Audio TX task start failed sid=%u", this->session_id_);
+  } else {
+    if (this->debug_logging_)
+      ESP_LOGW(TAG, "[diag] audio_tx_start sid=%u", this->session_id_);
+  }
+}
+
+void GeminiProxy::stop_audio_tx_task_(const char *reason) {
+  if (!this->audio_tx_running_.load())
+    return;
+  this->audio_tx_stop_requested_.store(true);
+  uint32_t start = millis();
+  while (this->audio_tx_running_.load() && millis() - start < 1500) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  if (this->audio_tx_running_.load()) {
+    ESP_LOGW(TAG, "Audio TX stop timeout sid=%u reason=%s", this->session_id_, reason);
+  } else {
+    if (this->debug_logging_)
+      ESP_LOGW(TAG, "[diag] audio_tx_stopped sid=%u reason=%s", this->session_id_, reason);
+  }
+}
+
+void GeminiProxy::audio_tx_task_(void *arg) {
+  auto *self = static_cast<GeminiProxy *>(arg);
+  if (self->debug_logging_)
+    ESP_LOGW(TAG, "[diag] audio_tx_task_enter sid=%u", self->session_id_);
+  uint32_t idle_loops = 0;
+
+  while (!self->audio_tx_stop_requested_.load() &&
+         self->session_state_.load() == SessionState::STREAMING_MIC) {
+    if (!self->ws_connected_.load() || !self->ring_buffer_) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    size_t available = self->ring_buffer_->available();
+    if (available < 2048) {
+      if (++idle_loops >= 100) {
+        idle_loops = 0;
+        if (self->debug_logging_)
+          ESP_LOGW(TAG, "[diag] audio_tx_waiting sid=%u available=%u", self->session_id_,
+                   static_cast<unsigned>(available));
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    idle_loops = 0;
+    size_t to_read = std::min(available, (size_t) 1024);
+    uint8_t buf[1024];
+    size_t read = self->ring_buffer_->read((void *) buf, to_read, 0);
+    if (read > 0) {
+      self->send_binary_(MSG_AUDIO_IN, buf, read);
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
+
+  if (self->debug_logging_)
+    ESP_LOGW(TAG, "[diag] audio_tx_task_exit sid=%u stop=%d state=%s ws=%d chunks=%u bytes=%u failures=%u",
+             self->session_id_, self->audio_tx_stop_requested_.load(),
+             state_name_(self->session_state_.load()), self->ws_connected_.load(),
+             self->audio_chunks_sent_.load(), self->audio_bytes_sent_.load(),
+             self->audio_send_failures_.load());
+  self->audio_tx_stop_requested_.store(false);
+  self->audio_tx_running_.store(false);
+  vTaskDelete(nullptr);
+}
+
 void GeminiProxy::ws_event_handler_(void *arg, esp_event_base_t event_base,
                                      int32_t event_id, void *event_data) {
   auto *self = static_cast<GeminiProxy *>(arg);
@@ -228,7 +428,9 @@ void GeminiProxy::ws_event_handler_(void *arg, esp_event_base_t event_base,
 
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
-      ESP_LOGI(TAG, "WS connected");
+      if (self->debug_logging_)
+        ESP_LOGI(TAG, "WS connected sid=%u state=%s", self->session_id_,
+                 state_name_(self->session_state_.load()));
       self->ws_connected_.store(true);
       if (self->session_state_.load() == SessionState::CONNECTING) {
         self->start_mic_requested_.store(true);
@@ -236,18 +438,27 @@ void GeminiProxy::ws_event_handler_(void *arg, esp_event_base_t event_base,
       break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
-      ESP_LOGW(TAG, "WS disconnected");
+      self->log_state_("ws_event_disconnected", "websocket_event");
       self->ws_connected_.store(false);
       break;
 
     case WEBSOCKET_EVENT_DATA:
       if (ws_data->op_code == 0x02 && ws_data->data_len > 0) {
+        uint8_t msg_type = static_cast<uint8_t>(ws_data->data_ptr[0]);
+        if (self->debug_logging_)
+          ESP_LOGW(TAG, "[diag] ws_data sid=%u type=%u len=%u state=%s", self->session_id_, msg_type,
+                   static_cast<unsigned>(ws_data->data_len), state_name_(self->session_state_.load()));
         self->on_ws_data_((const uint8_t *) ws_data->data_ptr, ws_data->data_len);
+      } else {
+        if (self->debug_logging_)
+          ESP_LOGW(TAG, "[diag] ws_data_ignored sid=%u opcode=%d len=%u state=%s", self->session_id_,
+                   ws_data->op_code, static_cast<unsigned>(ws_data->data_len),
+                   state_name_(self->session_state_.load()));
       }
       break;
 
     case WEBSOCKET_EVENT_ERROR:
-      ESP_LOGE(TAG, "WS error");
+      self->log_state_("ws_event_error", "websocket_error");
       break;
   }
 }
@@ -267,11 +478,25 @@ void GeminiProxy::on_ws_data_(const uint8_t *data, size_t len) {
       break;
 
     case 0x05:  // MSG_STATE_THINKING
-      break;  // Keep green spinning
+      if (this->session_state_.load() == SessionState::STREAMING_MIC) {
+        this->log_state_("state_thinking_before", "proxy_msg");
+        this->waiting_response_started_ms_ = millis();
+        this->session_state_.store(SessionState::WAITING_RESPONSE);
+        this->stop_mic_requested_.store(true);
+        if (this->ring_buffer_) {
+          this->ring_buffer_->reset();
+        }
+        g_set_phase.store(4);
+        this->log_state_("state_thinking", "proxy_msg");
+      } else {
+        this->log_state_("state_thinking_ignored", "not_streaming");
+      }
+      break;
 
     case MSG_RESPONSE_START: {
-      ESP_LOGW(TAG, "Response start → streaming audio");
+      this->log_state_("response_start_before", "proxy_msg");
       this->session_state_.store(SessionState::RESPONDING);
+      this->response_started_ms_ = millis();
 
       std::string http_url;
       if (len > 1) {
@@ -291,15 +516,21 @@ void GeminiProxy::on_ws_data_(const uint8_t *data, size_t len) {
       this->set_audio_url_(http_url);
       g_set_phase.store(5);  // replying phase
       this->play_audio_.store(true);  // loop() will trigger media_player
+      this->log_state_("response_start", http_url.c_str());
       break;
     }
 
     case MSG_RESPONSE_END: {
-      ESP_LOGW(TAG, "Response end");
-      this->reset_session_(false);
+      SessionState state_before_reset = this->session_state_.load();
+      this->log_state_("response_end", "proxy_msg");
+      this->reset_session_(false, "response_end");
       this->disconnect_requested_.store(true);
-      // Keep the replying LED phase until the media player reports that playback ended.
-      // This avoids a dark gap while the HTTP audio stream drains through the speaker pipeline.
+      if (state_before_reset != SessionState::RESPONDING) {
+        g_set_phase.store(1);
+      }
+      // For real responses, keep the replying LED phase until the media player
+      // reports that playback ended. This avoids a dark gap while the HTTP
+      // audio stream drains through the speaker pipeline.
       break;
     }
 
