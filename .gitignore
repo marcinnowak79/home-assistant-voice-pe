@@ -104,6 +104,8 @@ CMakeLists.txt
 
 # Sensitive or high-churn files:
 secrets.yaml
+home-assistant-voice-capture.yaml
+custom_wake_words/*.backup*/
 .idea/**/dataSources/
 .idea/**/dataSources.ids
 .idea/**/dataSources.xml
