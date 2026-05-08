@@ -25,6 +25,7 @@ GeminiProxy = gemini_proxy_ns.class_("GeminiProxy", cg.Component)
 # Actions callable from YAML
 StartAction = gemini_proxy_ns.class_("StartAction", automation.Action)
 StopAction = gemini_proxy_ns.class_("StopAction", automation.Action)
+CaptureAction = gemini_proxy_ns.class_("CaptureAction", automation.Action)
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -52,6 +53,21 @@ async def start_action_to_code(config, action_id, template_arg, args):
 async def stop_action_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(action_id, template_arg, paren)
+
+
+@automation.register_action("gemini_proxy.capture", CaptureAction, cv.Schema({
+    cv.GenerateID(): cv.use_id(GeminiProxy),
+    cv.Required("sample_type"): cv.templatable(cv.string),
+    cv.Optional("duration_ms", default=2000): cv.templatable(cv.positive_int),
+}))
+async def capture_action_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, paren)
+    template_ = await cg.templatable(config["sample_type"], args, cg.std_string)
+    cg.add(var.set_sample_type(template_))
+    duration = await cg.templatable(config["duration_ms"], args, cg.uint32)
+    cg.add(var.set_duration_ms(duration))
+    return var
 
 
 async def to_code(config):

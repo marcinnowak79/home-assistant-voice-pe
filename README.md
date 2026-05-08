@@ -48,6 +48,18 @@ gemini_proxy_url: "ws://homeassistant.local:8765"
 
 `secrets.yaml` is ignored by git and must not be published. If `homeassistant.local` is not resolvable from the Voice PE device, use the Home Assistant IP address.
 
+Wake word selection is compiled into the ESPHome firmware. To change it, edit the substitutions at the top of `home-assistant-voice-gemini.yaml` before compiling:
+
+```yaml
+wake_word_model: custom_wake_words/dzefrej/manifest.json
+wake_word_id: dzefrej
+wake_word_cutoff_slight: '217'
+wake_word_cutoff_moderate: '196'
+wake_word_cutoff_very: '176'
+```
+
+The model path must point to a microWakeWord manifest included in the firmware source tree. After changing the wake word model, compile and upload the firmware again.
+
 ### Compile and Upload
 
 ```bash

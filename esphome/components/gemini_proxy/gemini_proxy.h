@@ -19,6 +19,7 @@ namespace gemini_proxy {
 // Protocol: ESP32→Proxy
 static const uint8_t MSG_AUDIO_IN = 0x01;
 static const uint8_t MSG_AUDIO_END = 0x02;
+static const uint8_t MSG_CAPTURE_START = 0x10;
 
 // Protocol: Proxy→ESP32
 static const uint8_t MSG_AUDIO_OUT = 0x01;
@@ -49,6 +50,7 @@ class GeminiProxy : public Component {
 
   void start();
   void stop();
+  void capture(const std::string &sample_type, uint32_t duration_ms);
   bool is_running() const;
 
  protected:
@@ -87,6 +89,9 @@ class GeminiProxy : public Component {
   uint32_t waiting_response_started_ms_{0};
   uint32_t response_started_ms_{0};
   uint32_t session_id_{0};
+  bool capture_mode_{false};
+  std::string capture_sample_type_;
+  uint32_t capture_duration_ms_{2000};
   uint32_t last_active_diag_ms_{0};
   SessionState last_logged_state_{SessionState::IDLE};
 
@@ -116,6 +121,18 @@ template<typename... Ts> class StopAction : public Action<Ts...> {
  public:
   explicit StopAction(GeminiProxy *parent) : parent_(parent) {}
   void play(const Ts &...x) override { this->parent_->stop(); }
+ protected:
+  GeminiProxy *parent_;
+};
+
+template<typename... Ts> class CaptureAction : public Action<Ts...> {
+ public:
+  explicit CaptureAction(GeminiProxy *parent) : parent_(parent) {}
+  TEMPLATABLE_VALUE(std::string, sample_type)
+  TEMPLATABLE_VALUE(uint32_t, duration_ms)
+  void play(const Ts &...x) override {
+    this->parent_->capture(this->sample_type_.value(x...), this->duration_ms_.value(x...));
+  }
  protected:
   GeminiProxy *parent_;
 };

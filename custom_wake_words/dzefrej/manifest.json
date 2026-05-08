@@ -1,0 +1,16 @@
+{
+  "type": "micro",
+  "wake_word": "dzefrej",
+  "author": "Marcin Nowak",
+  "website": "https://decerto.com",
+  "model": "stream_state_internal_quant.tflite",
+  "version": 2,
+  "trained_languages": ["pl"],
+  "micro": {
+    "probability_cutoff": 0.85,
+    "sliding_window_size": 5,
+    "feature_step_size": 10,
+    "tensor_arena_size": 50000,
+    "minimum_esphome_version": "2024.7"
+  }
+}

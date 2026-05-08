@@ -1571,7 +1571,7 @@ sendspin:
   task_stack_in_psram: false
 
 http_request:
-  buffer_size_rx: 2048  # Reduces CPU load when streaming audio
+  buffer_size_rx: 8192  # Reduces CPU load and jitter when streaming audio
 
 audio_file:
   - id: center_button_press_sound

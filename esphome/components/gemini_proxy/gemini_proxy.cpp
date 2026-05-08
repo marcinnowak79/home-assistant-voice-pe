@@ -156,7 +156,9 @@ void GeminiProxy::loop() {
     this->response_started_ms_ = 0;
     this->session_state_.store(SessionState::STREAMING_MIC);
     this->start_audio_tx_task_();
-    g_set_phase.store(3);  // listening phase — green spin
+    if (!this->capture_mode_) {
+      g_set_phase.store(3);  // listening phase
+    }
     this->log_state_("active_streaming", "ws_connected");
   }
 
@@ -209,12 +211,42 @@ void GeminiProxy::start() {
   this->response_started_ms_ = 0;
   this->play_audio_.store(false);
   this->stop_mic_requested_.store(false);
+  this->capture_mode_ = false;
   this->last_active_diag_ms_ = 0;
   this->last_logged_state_ = SessionState::CONNECTING;
   if (this->ring_buffer_) {
     this->ring_buffer_->reset();
   }
   this->log_state_("start", "wake_word");
+  this->connect_();
+}
+
+void GeminiProxy::capture(const std::string &sample_type, uint32_t duration_ms) {
+  SessionState expected = SessionState::IDLE;
+  if (!this->session_state_.compare_exchange_strong(expected, SessionState::CONNECTING)) {
+    ESP_LOGW(TAG, "Already active, ignoring capture (state=%s)", state_name_(expected));
+    this->log_state_("capture_ignored", "not_idle");
+    return;
+  }
+
+  this->session_id_++;
+  this->connect_started_ms_ = millis();
+  this->streaming_started_ms_ = 0;
+  this->waiting_response_started_ms_ = 0;
+  this->response_started_ms_ = 0;
+  this->play_audio_.store(false);
+  this->stop_mic_requested_.store(false);
+  this->last_active_diag_ms_ = 0;
+  this->last_logged_state_ = SessionState::CONNECTING;
+  this->capture_mode_ = true;
+  this->capture_sample_type_ = sample_type.empty() ? "unknown" : sample_type;
+  this->capture_duration_ms_ = duration_ms == 0 ? 2000 : duration_ms;
+  if (this->ring_buffer_) {
+    this->ring_buffer_->reset();
+  }
+  ESP_LOGI(TAG, "Starting audio capture sample type=%s duration=%ums",
+           this->capture_sample_type_.c_str(), static_cast<unsigned>(this->capture_duration_ms_));
+  this->log_state_("capture_start", this->capture_sample_type_.c_str());
   this->connect_();
 }
 
@@ -303,6 +335,7 @@ void GeminiProxy::send_binary_(uint8_t type, const uint8_t *data, size_t len) {
 void GeminiProxy::reset_session_(bool close_socket, const char *reason) {
   this->log_state_("reset_session_begin", reason);
   this->session_state_.store(SessionState::IDLE);
+  this->capture_mode_ = false;
   this->start_mic_requested_.store(false);
   this->stop_mic_requested_.store(true);
   this->stop_audio_tx_task_(reason);
@@ -380,9 +413,34 @@ void GeminiProxy::audio_tx_task_(void *arg) {
   if (self->debug_logging_)
     ESP_LOGW(TAG, "[diag] audio_tx_task_enter sid=%u", self->session_id_);
   uint32_t idle_loops = 0;
+  uint32_t started_ms = millis();
+  bool capture_active_at_start = self->capture_mode_;
+  bool capture_end_sent = false;
+  if (capture_active_at_start) {
+    ESP_LOGI(TAG, "Capture TX start sid=%u type=%s duration=%ums", self->session_id_,
+             self->capture_sample_type_.c_str(), static_cast<unsigned>(self->capture_duration_ms_));
+    self->send_binary_(MSG_CAPTURE_START,
+                       reinterpret_cast<const uint8_t *>(self->capture_sample_type_.data()),
+                       self->capture_sample_type_.size());
+  }
 
   while (!self->audio_tx_stop_requested_.load() &&
          self->session_state_.load() == SessionState::STREAMING_MIC) {
+    if (self->capture_mode_ && millis() - started_ms >= self->capture_duration_ms_) {
+      self->send_binary_(MSG_AUDIO_END, nullptr, 0);
+      capture_end_sent = true;
+      self->log_state_("capture_audio_end", "duration_elapsed");
+      self->session_state_.store(SessionState::IDLE);
+      self->capture_mode_ = false;
+      self->stop_mic_requested_.store(true);
+      if (self->ring_buffer_) {
+        self->ring_buffer_->reset();
+      }
+      self->disconnect_requested_.store(true);
+      g_set_phase.store(1);
+      break;
+    }
+
     if (!self->ws_connected_.load() || !self->ring_buffer_) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
@@ -408,6 +466,18 @@ void GeminiProxy::audio_tx_task_(void *arg) {
       self->send_binary_(MSG_AUDIO_IN, buf, read);
       vTaskDelay(pdMS_TO_TICKS(20));
     }
+  }
+
+  if (capture_active_at_start && !capture_end_sent) {
+    ESP_LOGW(TAG, "Capture TX ended early sid=%u state=%s stop=%d ws=%d; sending AUDIO_END",
+             self->session_id_, state_name_(self->session_state_.load()),
+             self->audio_tx_stop_requested_.load(), self->ws_connected_.load());
+    if (self->ws_connected_.load()) {
+      self->send_binary_(MSG_AUDIO_END, nullptr, 0);
+    }
+    self->capture_mode_ = false;
+    self->stop_mic_requested_.store(true);
+    self->disconnect_requested_.store(true);
   }
 
   if (self->debug_logging_)
