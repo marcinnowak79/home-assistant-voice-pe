@@ -24,9 +24,9 @@ substitutions:
   wake_word_model: custom_wake_words/dzefrej/manifest.json
   wake_word_id: dzefrej
   # Quantized probability cutoffs for the wake word sensitivity select.
-  wake_word_cutoff_slight: '247'    # 0.97, conservative default
-  wake_word_cutoff_moderate: '230'  # 0.90
-  wake_word_cutoff_very: '217'      # 0.85
+  wake_word_cutoff_slight: '253'    # 0.99 = v14 step 9000 strict mode, 87.3% recall, 0 FA/h
+  wake_word_cutoff_moderate: '250'  # 0.98 = 94.1% recall, 0.38 FA/h (recommended daily)
+  wake_word_cutoff_very: '247'      # 0.97 = ~94.1% recall, ~0.45 FA/h (poprzedni default)
   # Substitutions for audio files
   jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac
   jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
