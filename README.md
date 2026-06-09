@@ -75,3 +75,49 @@ esphome upload home-assistant-voice-gemini.yaml --device /dev/cu.usbmodemXXXX
 ```
 
 On Linux this is usually `/dev/ttyACM0` or `/dev/ttyUSB0`.
+
+### Troubleshooting
+
+**Build fails with `Component not found: sensor.` / `- platform: rotary_encoder` (or `fatal error: flac_decoder.h`)**
+
+This happens on ESPHome **2026.5+** when the config still pulls the old `kahrendt/esphome` fork
+(`const`, `media_source`, `sendspin`) via `external_components`. The streaming media-player work
+(PR [#14933](https://github.com/esphome/esphome/pull/14933)) was merged into ESPHome core, and the
+old fork no longer compiles against it: its `const` is missing `CONF_B_CONSTANT` (which breaks the
+import of the whole `sensor` component — `rotary_encoder` is just the first platform under it, not
+the real cause), and its `sendspin` includes the now-relocated `flac_decoder.h`.
+
+Fix: pull the latest version of this branch. The fork's `external_components` block was removed —
+core now provides `const`, `media_source` and `sendspin`. If you maintain your own copy, delete that
+`kahrendt/esphome` source block.
+
+**Wake word works but you hear no Gemini response; logs show `http_media_source: Unable to determine file type`**
+
+The proxy streams the response as `audio/wav`, but core ESPHome only compiles in the audio decoders
+that are explicitly requested. Make sure this block is present (it is in the latest version):
+
+```yaml
+audio:
+  codecs:
+    wav:
+```
+
+**After flashing from the CLI, Home Assistant loses the connection and the wake word stops working**
+
+`api:` uses `encryption:` with no key, because the Home Assistant ESPHome add-on injects the device's
+key at build time. If you build/flash from the **CLI** instead, the firmware comes up with a different
+key and HA can no longer connect — and because the wake word is started by `voice_assistant:
+on_client_connected`, it never starts listening.
+
+To flash from the CLI, bake in the device's existing key: copy it from Home Assistant
+(Settings → Devices & Services → ESPHome → your device → encryption key, or the ESPHome add-on's
+`secrets.yaml` → `api_encryption_key`), put it in your local `secrets.yaml` as `api_encryption_key`,
+and set:
+
+```yaml
+api:
+  encryption:
+    key: !secret api_encryption_key
+```
+
+Or simply flash via the Home Assistant ESPHome add-on, which handles the key for you.
