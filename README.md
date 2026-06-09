@@ -48,17 +48,48 @@ gemini_proxy_url: "ws://homeassistant.local:8765"
 
 `secrets.yaml` is ignored by git and must not be published. If `homeassistant.local` is not resolvable from the Voice PE device, use the Home Assistant IP address.
 
-Wake word selection is compiled into the ESPHome firmware. To change it, edit the substitutions at the top of `home-assistant-voice-gemini.yaml` before compiling:
+Wake word selection is compiled into the ESPHome firmware. It is controlled by the substitutions at
+the top of `home-assistant-voice-gemini.yaml`. After changing them, compile and upload again.
 
 ```yaml
 wake_word_model: custom_wake_words/dzefrej/manifest.json
 wake_word_id: dzefrej
-wake_word_cutoff_slight: '217'
-wake_word_cutoff_moderate: '196'
-wake_word_cutoff_very: '176'
+wake_word_cutoff_slight: '253'      # ~0.99 probability, strictest (fewest false triggers)
+wake_word_cutoff_moderate: '250'    # ~0.98 probability, default
+wake_word_cutoff_very: '247'        # ~0.97 probability, most sensitive
 ```
 
-The model path must point to a microWakeWord manifest included in the firmware source tree. After changing the wake word model, compile and upload the firmware again.
+The three cutoffs are the probability thresholds (0–255, roughly `value / 255`) for the firmware's
+"Slightly / Moderately / Very" sensitivity levels — higher is stricter. The values above are tuned for
+the `dzefrej` model.
+
+**Use a stock wake word (simplest — nothing to add to the repo)**
+
+`wake_word_model` accepts a URL, so you can point it straight at an official microWakeWord manifest.
+The model and its `.tflite` are downloaded at build time:
+
+```yaml
+wake_word_model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/okay_nabu.json
+wake_word_id: okay_nabu
+```
+
+Available stock models (v2): `okay_nabu`, `hey_jarvis`, `hey_mycroft`, `alexa` — swap the filename in the
+URL and set `wake_word_id` to match. Each stock manifest ships its own probability cutoff; the
+`wake_word_cutoff_*` values above stay in effect for the sensitivity select, so leave them or adjust to
+taste.
+
+**Use a custom model**
+
+Drop the model's `manifest.json` and its `.tflite` into `custom_wake_words/<id>/`, then point the
+substitutions at it:
+
+```yaml
+wake_word_model: custom_wake_words/<id>/manifest.json
+wake_word_id: <id>
+```
+
+`wake_word_id` must match the `id` you want in ESPHome; the manifest's `model:` field must name a
+`.tflite` that sits next to it.
 
 ### Compile and Upload
 
