@@ -97,11 +97,6 @@ class GeminiProxy : public Component {
 
   // Mic send buffer — use ring buffer for thread safety (mic callback vs main loop)
   std::shared_ptr<RingBuffer> ring_buffer_;
-  // Rolling look-back buffer — always filled with the most recent mic audio,
-  // even before a session starts. When debug_logging is on, its contents are
-  // prepended to the outgoing stream so the proxy-saved WAV begins with the
-  // audio that triggered the wake word (for diagnosing false activations).
-  std::shared_ptr<RingBuffer> preroll_buffer_;
   std::atomic<size_t> dropped_audio_bytes_{0};
   std::atomic<uint32_t> audio_chunks_sent_{0};
   std::atomic<uint32_t> audio_bytes_sent_{0};

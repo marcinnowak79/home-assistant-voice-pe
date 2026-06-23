@@ -21,12 +21,14 @@ substitutions:
   # Set to DEBUG together with gemini_debug_logging for full ESPHome diagnostics.
   log_level: "INFO"
   # Wake word model compiled into the firmware. Change these before building OTA.
-  wake_word_model: custom_wake_words/dzefrej/manifest.json
-  wake_word_id: dzefrej
-  # Quantized probability cutoffs for the wake word sensitivity select.
-  wake_word_cutoff_slight: '253'    # 0.99 = v14 step 9000 strict mode, 87.3% recall, 0 FA/h
-  wake_word_cutoff_moderate: '250'  # 0.98 = 94.1% recall, 0.38 FA/h (recommended daily)
-  wake_word_cutoff_very: '247'      # 0.97 = ~94.1% recall, ~0.45 FA/h (poprzedni default)
+  # okay_nabu = stockowy model microWakeWord (ESPHome pobiera po samej nazwie).
+  # Aby wrócić do własnego "dżefrej": custom_wake_words/dzefrej/manifest.json + id dzefrej.
+  wake_word_model: okay_nabu
+  wake_word_id: okay_nabu
+  # Quantized probability cutoffs for the wake word sensitivity select (round(prob*255)).
+  wake_word_cutoff_slight: '253'    # 0.99 = najmniej fałszywek, najwięcej przegapień
+  wake_word_cutoff_moderate: '250'  # 0.98 = rozsądny default na co dzień
+  wake_word_cutoff_very: '247'      # 0.97 = najczulszy, więcej fałszywek
   # Substitutions for audio files
   jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac
   jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
@@ -1788,20 +1790,14 @@ micro_wake_word:
           # The custom Gemini stream owns the microphone until the session ends.
           - micro_wake_word.stop:
           - delay: 100ms
-          # Immediate active-color feedback while the wake sound plays.
+          # Immediate active-color feedback while the confirmation beep plays.
           - lambda: |-
               id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-              if (${gemini_debug_logging}) {
-                ESP_LOGW("gemini_proxy_yaml", "[diag] wake_accepted phase=%d", id(voice_assistant_phase));
-              }
           - script.execute: control_leds
-          - gemini_proxy.start:
-          - lambda: |-
-              if (${gemini_debug_logging}) {
-                ESP_LOGW("gemini_proxy_yaml",
-                         "[diag] gemini_proxy_start_returned phase=%d gemini_running=%d",
-                         id(voice_assistant_phase), id(gemini_proxy_client).is_running());
-              }
+          # Play the confirmation beep FIRST and wait for it to finish. Only then
+          # do we open the Gemini stream — so neither the wake word nor the beep
+          # is ever sent to Gemini, and the response timeouts start counting from
+          # this point (the user begins speaking after hearing the beep).
           - if:
               condition:
                 switch.is_on: wake_sound
@@ -1810,7 +1806,8 @@ micro_wake_word:
                     id: play_sound
                     priority: true
                     sound_file: "wake_word_triggered_sound"
-                - delay: 300ms
+                - delay: 350ms
+          - gemini_proxy.start:
 
 select:
   - platform: template

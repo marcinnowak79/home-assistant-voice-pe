@@ -54,13 +54,10 @@ void GeminiProxy::setup() {
 
   // 64KB after mono16 conversion is ~2 seconds of audio at 16kHz.
   this->ring_buffer_ = RingBuffer::create(65536);
-  // ~1.5s rolling look-back of pre-wake audio (16kHz mono16): 16000*2*1.5 = 48000B.
-  this->preroll_buffer_ = RingBuffer::create(48000);
 
   // Register mic callback. The mic runs continuously (kept alive by
-  // micro_wake_word), so this fires even between sessions: we always keep the
-  // most recent audio in preroll_buffer_, and additionally forward to the send
-  // ring buffer while a session is actively streaming.
+  // micro_wake_word), but we only forward audio to the send ring buffer while a
+  // session is actively streaming — nothing is captured before that.
   if (this->mic_ != nullptr) {
     this->mic_->add_data_callback([this](const std::vector<uint8_t> &data) {
       if (data.size() < 8)
@@ -73,11 +70,6 @@ void GeminiProxy::setup() {
         mono[i] = static_cast<int16_t>(samples[i * 2] >> 16);  // channel 0 -> mono16
       }
       size_t bytes = mono.size() * sizeof(int16_t);
-
-      // Always keep the rolling look-back buffer current (overwrites oldest).
-      if (this->preroll_buffer_) {
-        this->preroll_buffer_->write(mono.data(), bytes);
-      }
 
       // Only forward to the send buffer while actively streaming a session.
       if (this->session_state_.load() != SessionState::STREAMING_MIC)
@@ -436,29 +428,6 @@ void GeminiProxy::audio_tx_task_(void *arg) {
     self->send_binary_(MSG_CAPTURE_START,
                        reinterpret_cast<const uint8_t *>(self->capture_sample_type_.data()),
                        self->capture_sample_type_.size());
-  }
-
-  // Debug: prepend the rolling look-back buffer (audio captured BEFORE the wake
-  // word fired) so the proxy-saved input WAV begins with what actually
-  // triggered detection. Gated on debug_logging_ so normal sessions are
-  // unaffected.
-  if (self->debug_logging_ && !capture_active_at_start && self->preroll_buffer_ &&
-      self->ws_connected_.load()) {
-    uint8_t pbuf[1024];
-    size_t pre_sent = 0;
-    size_t pre_avail = self->preroll_buffer_->available();
-    while (pre_avail > 0 && self->ws_connected_.load()) {
-      size_t to_read = std::min(pre_avail, sizeof(pbuf));
-      size_t r = self->preroll_buffer_->read((void *) pbuf, to_read, 0);
-      if (r == 0)
-        break;
-      self->send_binary_(MSG_AUDIO_IN, pbuf, r);
-      pre_sent += r;
-      pre_avail = self->preroll_buffer_->available();
-      vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    ESP_LOGW(TAG, "[diag] preroll_prepended sid=%u bytes=%u", self->session_id_,
-             static_cast<unsigned>(pre_sent));
   }
 
   while (!self->audio_tx_stop_requested_.load() &&
